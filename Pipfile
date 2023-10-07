@@ -8,6 +8,9 @@ sdcflows = {ref = "master", git = "git+https://github.com/nipreps/sdcflows.git"}
 typer = "*"
 niworkflows = {ref = "master", git = "git+https://github.com/nipreps/niworkflows.git"}
 
+[scripts]
+resample = "python resampler.py"
+
 [dev-packages]
 
 [requires]
