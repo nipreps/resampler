@@ -254,7 +254,7 @@ def load_ants_h5(filename: Path) -> nt.TransformChain:
     return nt.TransformChain([warp_transform, nt.Affine(affine)])
 
 
-def load_transforms(xfm_paths: list[Path]) -> nt.TransformBase:
+def load_transforms(xfm_paths: list[Path]) -> nt.base.TransformBase:
     """Load a series of transforms as a nitransforms TransformChain
 
     An empty list will return an identity transform
