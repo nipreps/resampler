@@ -1,0 +1,14 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+sdcflows = {ref = "master", git = "git+https://github.com/nipreps/sdcflows.git"}
+typer = "*"
+niworkflows = {ref = "master", git = "git+https://github.com/nipreps/niworkflows.git"}
+
+[dev-packages]
+
+[requires]
+python_version = "3.10"
