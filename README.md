@@ -21,3 +21,8 @@ pip install git+https://github.com/nipreps/niworkflows.git \
 ```
 
 These should pull in all the other imports as dependencies.
+Once installed, run with:
+
+```console
+python resampler.py --help
+```
