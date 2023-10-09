@@ -1,4 +1,8 @@
+import asyncio
+import os
+from functools import partial
 from pathlib import Path
+from typing import Callable, TypeVar
 
 import h5py
 import nibabel as nb
@@ -14,6 +18,9 @@ from sdcflows.transform import grid_bspline_weights
 from sdcflows.utils.tools import ensure_positive_cosines
 from templateflow import api as tf
 from typing_extensions import Annotated
+
+
+R = TypeVar('R')
 
 nipreps_cfg = niworkflows.data.load('nipreps.json')
 
@@ -104,6 +111,118 @@ def resample_vol(
     )
     result *= jacobian
     return result
+
+
+async def worker(job: Callable[[], R], semaphore) -> R:
+    async with semaphore:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, job)
+
+
+async def resample_series_parallel(
+    data: np.ndarray,
+    coordinates: np.ndarray,
+    pe_info: list[tuple[int, float]],
+    hmc_xfms: list[np.ndarray] | None,
+    fmap_hz: np.ndarray,
+    output_dtype: np.dtype | None = None,
+    order: int = 3,
+    mode: str = 'constant',
+    cval: float = 0.0,
+    prefilter: bool = True,
+    max_concurrent: int = min(os.cpu_count(), 12),
+) -> np.ndarray:
+    """Resample a 4D time series at specified coordinates
+
+    This function implements simultaneous head-motion correction and
+    susceptibility-distortion correction. It accepts coordinates in
+    the source voxel space. It is the responsibility of the caller to
+    transform coordinates from any other target space.
+
+    Parameters
+    ----------
+    data
+        The data array to resample
+    coordinates
+        The first-approximation voxel coordinates to sample from ``data``.
+        The first dimension should have length 3.
+        The further dimensions determine the shape of the target array.
+    pe_info
+        A list of readout vectors in the form of (axis, signed-readout-time)
+        ``(1, -0.04)`` becomes ``[0, -0.04, 0]``, which indicates that a
+        +1 Hz deflection in the field shifts 0.04 voxels toward the start
+        of the data array in the second dimension.
+    hmc_xfm
+        A sequence of affine transformations accounting for head motion from
+        the individual volume into the BOLD reference space.
+        These affines must be in VOX2VOX form.
+    fmap_hz
+        The fieldmap, sampled to the target space, in Hz
+    output_dtype
+        The dtype of the output array.
+    order
+        Order of interpolation (default: 3 = cubic)
+    mode
+        How ``data`` is extended beyond its boundaries. See
+        :func:`scipy.ndimage.map_coordinates` for more details.
+    cval
+        Value to fill past edges of ``data`` if ``mode`` is ``'constant'``.
+    prefilter
+        Determines if ``data`` is pre-filtered before interpolation.
+    max_concurrent
+        Maximum number of volumes to resample concurrently
+
+    Returns
+    -------
+    resampled_array
+        The resampled array, with shape ``coordinates.shape[1:] + (N,)``,
+        where N is the number of volumes in ``data``.
+    """
+    if data.ndim == 3:
+        return resample_vol(
+            data,
+            coordinates,
+            pe_info[0],
+            hmc_xfms[0] if hmc_xfms else None,
+            fmap_hz,
+            output_dtype,
+            order,
+            mode,
+            cval,
+            prefilter,
+        )
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    out_array = np.zeros(
+        coordinates.shape[1:] + data.shape[-1:], dtype=output_dtype
+    )
+
+    tasks = [
+        asyncio.create_task(
+            worker(
+                partial(
+                    resample_vol,
+                    data=volume,
+                    coordinates=coordinates.copy(),
+                    pe_info=pe_info[volid],
+                    hmc_xfm=hmc_xfms[volid] if hmc_xfms else None,
+                    fmap_hz=fmap_hz,
+                    output=out_array[..., volid],
+                    order=order,
+                    mode=mode,
+                    cval=cval,
+                    prefilter=prefilter,
+                ),
+                semaphore,
+            )
+        )
+        for volid, volume in enumerate(np.rollaxis(data, -1, 0))
+    ]
+
+    await asyncio.gather(*tasks)
+
+    return out_array
 
 
 def resample_series(
@@ -373,6 +492,7 @@ def resample_bold(
     transforms: nt.TransformChain,
     fieldmap: nb.Nifti1Image | None,
     pe_info: list[tuple[int, float]] | None,
+    nthreads: int = 1,
 ) -> nb.Nifti1Image:
     """Resample a 4D bold series into a target space, applying head-motion
     and susceptibility-distortion correction simultaneously.
@@ -393,6 +513,8 @@ def resample_bold(
         ``(1, -0.04)`` becomes ``[0, -0.04, 0]``, which indicates that a
         +1 Hz deflection in the field shifts 0.04 voxels toward the start
         of the data array in the second dimension.
+    nthreads
+        Number of threads to use for parallel resampling
 
     Returns
     -------
@@ -427,13 +549,16 @@ def resample_bold(
     if pe_info is None:
         pe_info = [[0, 0] for _ in range(source.shape[-1])]
 
-    resampled_data = resample_series(
-        data=source.get_fdata(dtype='f4'),
-        coordinates=mapped_coordinates.T.reshape((3, *target.shape[:3])),
-        pe_info=pe_info,
-        hmc_xfms=hmc_xfms,
-        fmap_hz=fieldmap.get_fdata(dtype='f4'),
-        output_dtype='f4',
+    resampled_data = asyncio.run(
+        resample_series_parallel(
+            data=source.get_fdata(dtype='f4'),
+            coordinates=mapped_coordinates.T.reshape((3, *target.shape[:3])),
+            pe_info=pe_info,
+            hmc_xfms=hmc_xfms,
+            fmap_hz=fieldmap.get_fdata(dtype='f4'),
+            output_dtype='f4',
+            max_concurrent=nthreads,
+        )
     )
     resampled_img = nb.Nifti1Image(
         resampled_data, target.affine, target.header
@@ -474,6 +599,10 @@ def main(
     output_dir: Path,
     space: Annotated[str, typer.Option(help='Target space to resample to')],
     resolution: Annotated[str, typer.Option(help='Target resolution')] = None,
+    nthreads: Annotated[
+        int,
+        typer.Option(help='Number of resampling threads (0 for all cores)'),
+    ] = 1,
 ):
     """Resample a bold file to a target space using the transforms found
     in a derivatives directory.
@@ -486,6 +615,12 @@ def main(
         zooms = tuple(int(dim) for dim in resolution.split('x'))
         if len(zooms) not in (1, 3):
             raise ValueError(f'Unknown resolution: {resolution}')
+
+    cpu_count = os.cpu_count()
+    if nthreads < 1:
+        nthreads = cpu_count
+    elif nthreads > cpu_count:
+        print(f'Warning: More threads requested ({nthreads}) than cores ({cpu_count})')
 
     bold = raw.files[str(bold_file)]
     bold_meta = bold.get_metadata()
@@ -634,6 +769,7 @@ def main(
         transforms=load_transforms(bold_xfms),
         fieldmap=fieldmap,
         pe_info=[pe_info for _ in range(source.shape[-1])],
+        nthreads=nthreads,
     ).to_filename(output_dir / bold_file.name)
 
 
