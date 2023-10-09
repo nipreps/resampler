@@ -115,11 +115,8 @@ def resample_vol(
 
 async def worker(job: Callable[[], R], semaphore) -> R:
     async with semaphore:
-        print(f'Starting {hex(id(job))}')
         loop = asyncio.get_running_loop()
-        ret = await loop.run_in_executor(None, job)
-        print(f'Completed {hex(id(job))}')
-        return ret
+        return await loop.run_in_executor(None, job)
 
 
 async def resample_series_parallel(
@@ -495,6 +492,7 @@ def resample_bold(
     transforms: nt.TransformChain,
     fieldmap: nb.Nifti1Image | None,
     pe_info: list[tuple[int, float]] | None,
+    nthreads: int = 1,
 ) -> nb.Nifti1Image:
     """Resample a 4D bold series into a target space, applying head-motion
     and susceptibility-distortion correction simultaneously.
@@ -515,6 +513,8 @@ def resample_bold(
         ``(1, -0.04)`` becomes ``[0, -0.04, 0]``, which indicates that a
         +1 Hz deflection in the field shifts 0.04 voxels toward the start
         of the data array in the second dimension.
+    nthreads
+        Number of threads to use for parallel resampling
 
     Returns
     -------
@@ -557,7 +557,7 @@ def resample_bold(
             hmc_xfms=hmc_xfms,
             fmap_hz=fieldmap.get_fdata(dtype='f4'),
             output_dtype='f4',
-            max_concurrent=4,
+            max_concurrent=nthreads,
         )
     )
     resampled_img = nb.Nifti1Image(
@@ -599,6 +599,10 @@ def main(
     output_dir: Path,
     space: Annotated[str, typer.Option(help='Target space to resample to')],
     resolution: Annotated[str, typer.Option(help='Target resolution')] = None,
+    nthreads: Annotated[
+        int,
+        typer.Option(help='Number of resampling threads (0 for all cores)'),
+    ] = 1,
 ):
     """Resample a bold file to a target space using the transforms found
     in a derivatives directory.
@@ -611,6 +615,12 @@ def main(
         zooms = tuple(int(dim) for dim in resolution.split('x'))
         if len(zooms) not in (1, 3):
             raise ValueError(f'Unknown resolution: {resolution}')
+
+    cpu_count = os.cpu_count()
+    if nthreads < 1:
+        nthreads = cpu_count
+    elif nthreads > cpu_count:
+        print(f'Warning: More threads requested ({nthreads}) than cores ({cpu_count})')
 
     bold = raw.files[str(bold_file)]
     bold_meta = bold.get_metadata()
@@ -759,6 +769,7 @@ def main(
         transforms=load_transforms(bold_xfms),
         fieldmap=fieldmap,
         pe_info=[pe_info for _ in range(source.shape[-1])],
+        nthreads=nthreads,
     ).to_filename(output_dir / bold_file.name)
 
 
