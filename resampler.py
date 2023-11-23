@@ -122,7 +122,7 @@ async def worker(job: Callable[[], R], semaphore) -> R:
         return await loop.run_in_executor(None, job)
 
 
-async def resample_series_parallel(
+async def resample_series_async(
     data: np.ndarray,
     coordinates: np.ndarray,
     pe_info: list[tuple[int, float]],
@@ -239,6 +239,7 @@ def resample_series(
     mode: str = 'constant',
     cval: float = 0.0,
     prefilter: bool = True,
+    nthreads: int = 1,
 ) -> np.ndarray:
     """Resample a 4D time series at specified coordinates
 
@@ -284,39 +285,21 @@ def resample_series(
         The resampled array, with shape ``coordinates.shape[1:] + (N,)``,
         where N is the number of volumes in ``data``.
     """
-    if data.ndim == 3:
-        return resample_vol(
-            data,
-            coordinates,
-            pe_info[0],
-            hmc_xfms[0] if hmc_xfms else None,
-            fmap_hz,
-            output_dtype,
-            order,
-            mode,
-            cval,
-            prefilter,
-        )
-
-    out_array = np.zeros(
-        coordinates.shape[1:] + data.shape[-1:], dtype=output_dtype
-    )
-
-    for volid, volume in enumerate(np.rollaxis(data, -1, 0)):
-        resample_vol(
-            data=volume,
-            coordinates=coordinates.copy(),
-            pe_info=pe_info[volid],
-            hmc_xfm=hmc_xfms[volid] if hmc_xfms else None,
+    return asyncio.run(
+        resample_series_async(
+            data=data,
+            coordinates=coordinates,
+            pe_info=pe_info,
+            hmc_xfms=hmc_xfms,
             fmap_hz=fmap_hz,
-            output=out_array[..., volid],
+            output_dtype=output_dtype,
             order=order,
             mode=mode,
             cval=cval,
             prefilter=prefilter,
+            max_concurrent=nthreads,
         )
-
-    return out_array
+    )
 
 
 def parse_combined_hdf5(h5_fn, to_ras=True):
@@ -552,16 +535,14 @@ def resample_bold(
     if pe_info is None:
         pe_info = [[0, 0] for _ in range(source.shape[-1])]
 
-    resampled_data = asyncio.run(
-        resample_series_parallel(
-            data=source.get_fdata(dtype='f4'),
-            coordinates=mapped_coordinates.T.reshape((3, *target.shape[:3])),
-            pe_info=pe_info,
-            hmc_xfms=hmc_xfms,
-            fmap_hz=fieldmap.get_fdata(dtype='f4'),
-            output_dtype='f4',
-            max_concurrent=nthreads,
-        )
+    resampled_data = resample_series(
+        data=source.get_fdata(dtype='f4'),
+        coordinates=mapped_coordinates.T.reshape((3, *target.shape[:3])),
+        pe_info=pe_info,
+        hmc_xfms=hmc_xfms,
+        fmap_hz=fieldmap.get_fdata(dtype='f4'),
+        output_dtype='f4',
+        nthreads=nthreads,
     )
     resampled_img = nb.Nifti1Image(
         resampled_data, target.affine, target.header
