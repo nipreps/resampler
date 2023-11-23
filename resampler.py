@@ -94,6 +94,9 @@ def resample_vol(
         coordinates = nb.affines.apply_affine(
             hmc_xfm, coordinates.reshape(coords_shape[0], -1).T
         ).T.reshape(coords_shape)
+    else:
+        # Copy coordinates to avoid interfering with other calls
+        coordinates = coordinates.copy()
 
     vsm = fmap_hz * pe_info[1]
     coordinates[pe_info[0], ...] += vsm
@@ -194,9 +197,9 @@ async def resample_series_parallel(
 
     semaphore = asyncio.Semaphore(max_concurrent)
 
-    out_array = np.zeros(
-        coordinates.shape[1:] + data.shape[-1:], dtype=output_dtype
-    )
+    # Order F ensures individual volumes are contiguous in memory
+    # Also matches NIfTI, making final save more efficient
+    out_array = np.zeros(coordinates.shape[1:] + data.shape[-1:], dtype=output_dtype, order='F')
 
     tasks = [
         asyncio.create_task(
@@ -204,7 +207,7 @@ async def resample_series_parallel(
                 partial(
                     resample_vol,
                     data=volume,
-                    coordinates=coordinates.copy(),
+                    coordinates=coordinates,
                     pe_info=pe_info[volid],
                     hmc_xfm=hmc_xfms[volid] if hmc_xfms else None,
                     fmap_hz=fmap_hz,
